@@ -1,0 +1,59 @@
+{
+  "manifest_version": 3,
+  "name": "Gmail Order Tracker - Essential Functions",
+  "version": "1.0",
+  "description": "Core functions: Gmail scanning, email reading, calendar events, and LLM calls",
+  "permissions": [
+    "identity",
+    "storage",
+    "scripting",
+    "activeTab",
+    "tabs"
+  ],
+  "oauth2": {
+    "client_id": "803101888824-7u2bplscj65rnpdhkjchs9cud09som5m.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/calendar.events"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mail.google.com/*",
+        "https://gmail.com/*",
+        "https://*/*",
+        "http://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+
+  "host_permissions": [
+    "https://mail.google.com/*",
+    "https://gmail.com/*",
+    "https://www.googleapis.com/*",
+    "https://*/*",
+    "http://*/*"
+  ]
+}

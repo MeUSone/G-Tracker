@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 450px;
+      padding: 20px;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      background: #ffffff;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #e8eaed;
+    }
+
+    .header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 500;
+      color: #202124;
+      flex: 1;
+    }
+
+    .header .icon {
+      font-size: 20px;
+      margin-right: 8px;
+    }
+
+    .function-button {
+      width: 100%;
+      padding: 10px 16px;
+      background: #1a73e8;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background-color 0.2s;
+      margin-bottom: 8px;
+    }
+
+    .function-button:hover:not(:disabled) {
+      background: #1557b0;
+    }
+
+    .function-button:disabled {
+      background: #f1f3f4;
+      color: #9aa0a6;
+      cursor: not-allowed;
+    }
+
+    .result-area {
+      background: #f8f9fa;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 12px;
+      font-size: 12px;
+      color: #5f6368;
+      max-height: 200px;
+      overflow-y: auto;
+      display: none;
+    }
+
+    .result-area.visible {
+      display: block;
+    }
+
+    .footer {
+      font-size: 11px;
+      color: #9aa0a6;
+      text-align: center;
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #f1f3f4;
+    }
+
+    /* Package Tracking Styles */
+    .package-section {
+      margin-top: 0;
+      padding-top: 0;
+    }
+
+    .section-title {
+      font-size: 16px;
+      font-weight: 500;
+      color: #202124;
+      margin: 0 0 12px 0;
+    }
+
+    .date-range-section {
+      display: grid;
+      grid-template-columns: auto 1fr auto 1fr;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+
+    .date-input {
+      padding: 6px 8px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    .package-button {
+      background: #34a853;
+    }
+
+    .package-button:hover:not(:disabled) {
+      background: #2d8f47;
+    }
+
+    .progress-section {
+      margin: 12px 0;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 6px;
+      background: #f1f3f4;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: #1a73e8;
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+
+    .progress-text {
+      font-size: 12px;
+      color: #5f6368;
+      text-align: center;
+    }
+
+    .packages-list {
+      margin-top: 12px;
+    }
+
+    .month-group {
+      margin-bottom: 16px;
+    }
+
+    .month-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: #e8f0fe;
+      border: 1px solid #dadce0;
+      border-radius: 6px;
+      padding: 12px 16px;
+      cursor: pointer;
+      transition: background-color 0.2s;
+      margin-bottom: 8px;
+    }
+
+    .month-header:hover {
+      background: #d2e3fc;
+    }
+
+    .month-title {
+      font-weight: 500;
+      color: #1a73e8;
+      font-size: 14px;
+    }
+
+    .month-toggle {
+      font-size: 12px;
+      color: #5f6368;
+      transition: transform 0.2s;
+    }
+
+    .month-toggle.collapsed {
+      transform: rotate(-90deg);
+    }
+
+    .month-packages {
+      margin-left: 8px;
+      transition: max-height 0.3s ease-out, opacity 0.3s ease-out;
+      overflow: hidden;
+      max-height: 1000px; /* Large enough to show all packages */
+      opacity: 1;
+    }
+
+    .month-packages.collapsed {
+      max-height: 0;
+      opacity: 0;
+    }
+
+    .package-item {
+      background: #f8f9fa;
+      border: 1px solid #e8eaed;
+      border-radius: 6px;
+      padding: 12px;
+      margin-bottom: 8px;
+    }
+
+    .package-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .package-sender {
+      font-weight: 500;
+      color: #202124;
+      text-transform: capitalize;
+    }
+
+    .package-date {
+      font-size: 11px;
+      color: #5f6368;
+    }
+
+    .package-details {
+      font-size: 12px;
+      color: #5f6368;
+      margin-bottom: 8px;
+    }
+
+    .package-email-link {
+      margin-bottom: 8px;
+    }
+
+    .email-link {
+      color: #1a73e8;
+      text-decoration: none;
+      font-size: 12px;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .email-link:hover {
+      text-decoration: underline;
+      color: #1557b0;
+    }
+
+    .pickup-button {
+      background: #ea4335;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 6px 12px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: background-color 0.2s;
+      width: 100%;
+    }
+
+    .pickup-button:hover {
+      background: #d33b2c;
+    }
+
+    .no-packages {
+      text-align: center;
+      color: #5f6368;
+      font-size: 12px;
+      padding: 20px;
+      font-style: italic;
+    }
+
+    .scan-info {
+      text-align: center;
+      margin-top: 8px;
+      margin-bottom: 12px;
+    }
+
+    .scan-info small {
+      color: #5f6368;
+      font-size: 11px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="header">
+    <span class="icon">📦</span>
+    <h1>Package Delivery Tracker</h1>
+  </div>
+
+  <!-- Package Tracking Section -->
+  <div class="package-section">
+    <h2 class="section-title">📦 Package Tracking</h2>
+    
+    <div class="date-range-section">
+      <label for="startDate">From:</label>
+      <input type="date" id="startDate" class="date-input">
+      <label for="endDate">To:</label>
+      <input type="date" id="endDate" class="date-input">
+    </div>
+
+    <button class="function-button package-button" id="scanPackagesBtn">
+      🔍 Scan for Package Deliveries
+    </button>
+
+    <div class="progress-section" id="progressSection" style="display: none;">
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="progress-text" id="progressText">Initializing...</div>
+    </div>
+
+    <div class="packages-list" id="packagesList"></div>
+  </div>
+
+  <div class="result-area" id="resultArea">
+    Results will appear here...
+  </div>
+
+  <div class="footer">
+    Package Delivery Tracker
+  </div>
+
+  <script type="module" src="popup.js"></script>
+</body>
+
+</html>
