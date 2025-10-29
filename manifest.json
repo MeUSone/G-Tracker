@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Gmail Order Tracker - Essential Functions",
+  "name": "Gmail Order Tracker",
   "version": "1.0",
   "description": "Core functions: Gmail scanning, email reading, calendar events, and LLM calls",
   "permissions": [
@@ -48,7 +48,6 @@
       "run_at": "document_end"
     }
   ],
-
   "host_permissions": [
     "https://mail.google.com/*",
     "https://gmail.com/*",

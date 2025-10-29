@@ -28,7 +28,7 @@ export const SEARCH_QUERIES = {
  * LLM Configuration
  */
 export const LLM_CONFIG = {
-    TEMPERATURE: 0.1,
+    TEMPERATURE: 1,
     TOP_K: 3,
     SYSTEM_PROMPT: 'You are a helpful AI assistant. Provide clear and accurate responses.'
 };
@@ -68,7 +68,12 @@ export const MESSAGE_TYPES = {
     SAVE_SCAN_HISTORY: 'SAVE_SCAN_HISTORY',
     // Scanning state management
     GET_SCANNING_STATE: 'GET_SCANNING_STATE',
-    SCANNING_STATE_CHANGED: 'SCANNING_STATE_CHANGED'
+    SCANNING_STATE_CHANGED: 'SCANNING_STATE_CHANGED',
+    // Subscription tracking messages
+    SCAN_SUBSCRIPTION_EMAILS: 'SCAN_SUBSCRIPTION_EMAILS',
+    GET_SUBSCRIPTIONS: 'GET_SUBSCRIPTIONS',
+    // Cleanup messages
+    CLEANUP_SCAN_STATES: 'CLEANUP_SCAN_STATES'
 };
 
 /**
@@ -89,9 +94,45 @@ export const PACKAGE_CONFIG = {
         'delivered to'
     ],
     DB_NAME: 'PackageTracker',
-    DB_VERSION: 3,
+    DB_VERSION: 5,
     STORE_NAME: 'packages',
-    SCAN_HISTORY_STORE_NAME: 'scan_history'
+    SUBSCRIPTION_STORE_NAME: 'subscriptions',
+    SCAN_HISTORY_STORE_NAME: 'scan_history',
+    SUBSCRIPTION_SCAN_HISTORY_STORE_NAME: 'subscription_scan_history',
+    SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME: 'subscription_calendar_events'
+};
+
+/**
+ * Subscription Tracking Configuration
+ */
+export const SUBSCRIPTION_CONFIG = {
+    DEFAULT_SEARCH_KEYWORDS: [
+        'subscription',
+        'billing',
+        'payment',
+        'invoice',
+        'receipt',
+        'charged',
+        'renewal',
+        'monthly subscription',
+        'annual subscription'
+    ]
+};
+
+/**
+ * Subscription Database Schema
+ */
+export const SUBSCRIPTION_SCHEMA = {
+    ID: 'id',
+    USER_EMAIL: 'userEmail',
+    SUBSCRIPTION_NAME: 'subscriptionName',
+    AMOUNT: 'amount',
+    BILLING_DATE: 'billingDate',
+    REMINDER_DATE: 'reminderDate',
+    EMAIL_ID: 'emailId',
+    EMAIL_SUBJECT: 'emailSubject',
+    EMAIL_FROM: 'emailFrom',
+    CREATED_AT: 'createdAt'
 };
 
 /**
@@ -123,6 +164,32 @@ export const SCAN_HISTORY_SCHEMA = {
     START_DATE_REQUESTED: 'startDateRequested',
     END_DATE_REQUESTED: 'endDateRequested',
     PACKAGES_FOUND: 'packagesFound'
+};
+
+/**
+ * Subscription Scan History Database Schema
+ */
+export const SUBSCRIPTION_SCAN_HISTORY_SCHEMA = {
+    ID: 'id',
+    SCAN_DATE: 'scanDate',
+    START_DATE: 'startDate',
+    END_DATE: 'endDate',
+    EMAILS_SCANNED: 'emailsScanned',
+    SUBSCRIPTIONS_FOUND: 'subscriptionsFound',
+    CALENDAR_EVENTS_CREATED: 'calendarEventsCreated'
+};
+
+/**
+ * Subscription Calendar Events Database Schema
+ */
+export const SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA = {
+    ID: 'id',
+    EMAIL_ID: 'emailId',
+    SUBSCRIPTION_NAME: 'subscriptionName',
+    CALENDAR_EVENT_ID: 'calendarEventId',
+    CREATED_DATE: 'createdDate',
+    EMAIL_SUBJECT: 'emailSubject',
+    EMAIL_FROM: 'emailFrom'
 };
 
 /**

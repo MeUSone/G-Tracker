@@ -82,6 +82,53 @@
       border-top: 1px solid #f1f3f4;
     }
 
+    /* Subscription Tracking Styles */
+    .subscription-section {
+      margin-top: 0;
+      padding-top: 0;
+      margin-bottom: 20px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #f1f3f4;
+    }
+
+    .subscription-button {
+      background: #9c27b0;
+    }
+
+    .subscription-button:hover:not(:disabled) {
+      background: #7b1fa2;
+    }
+
+    .subscription-results {
+      margin-top: 12px;
+      font-size: 12px;
+    }
+
+    .subscription-item {
+      background: #f3e5f5;
+      border: 1px solid #e1bee7;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 8px;
+    }
+
+    .subscription-name {
+      font-weight: 500;
+      color: #4a148c;
+      margin-bottom: 4px;
+    }
+
+    .subscription-amount {
+      color: #6a1b9a;
+      font-size: 11px;
+    }
+
+    .subscription-reminder {
+      color: #8e24aa;
+      font-size: 10px;
+      margin-top: 4px;
+    }
+
     /* Package Tracking Styles */
     .package-section {
       margin-top: 0;
@@ -289,7 +336,25 @@
 <body>
   <div class="header">
     <span class="icon">📦</span>
-    <h1>Package Delivery Tracker</h1>
+    <h1>Gmail Tracker</h1>
+  </div>
+
+  <!-- Subscription Tracking Section -->
+  <div class="subscription-section">
+    <h2 class="section-title">💳 Subscription Tracker</h2>
+    
+    <button class="function-button subscription-button" id="scanSubscriptionsBtn">
+      🔍 Scan My Current Month Subscriptions
+    </button>
+
+    <div class="progress-section" id="subscriptionProgressSection" style="display: none;">
+      <div class="progress-bar">
+        <div class="progress-fill" id="subscriptionProgressFill"></div>
+      </div>
+      <div class="progress-text" id="subscriptionProgressText">Initializing...</div>
+    </div>
+
+    <div class="subscription-results" id="subscriptionResults"></div>
   </div>
 
   <!-- Package Tracking Section -->
@@ -322,7 +387,7 @@
   </div>
 
   <div class="footer">
-    Package Delivery Tracker
+    Gmail Tracker - Subscriptions & Packages
   </div>
 
   <script type="module" src="popup.js"></script>

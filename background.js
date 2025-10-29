@@ -8,11 +8,24 @@ import {
   MESSAGE_TYPES,
   PACKAGE_CONFIG,
   PACKAGE_SCHEMA,
-  SCAN_HISTORY_SCHEMA
+  SUBSCRIPTION_SCHEMA,
+  SCAN_HISTORY_SCHEMA,
+  SUBSCRIPTION_SCAN_HISTORY_SCHEMA,
+  SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA,
+  SUBSCRIPTION_CONFIG
 } from './constants.js';
 
 // Service worker startup log
 console.log('Package Tracker service worker starting...');
+
+// Keep service worker alive
+let keepAliveInterval;
+
+function keepServiceWorkerAlive() {
+  keepAliveInterval = setInterval(() => {
+    console.log('Service worker keepalive ping');
+  }, 20000); // Ping every 20 seconds
+}
 
 // Service worker event listeners
 self.addEventListener('install', (event) => {
@@ -22,8 +35,79 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   console.log('Service worker activating...');
-  event.waitUntil(self.clients.claim());
+  event.waitUntil(
+    Promise.all([
+      self.clients.claim(),
+      cleanupOnStartup()
+    ])
+  );
+
+  // Start keepalive
+  keepServiceWorkerAlive();
 });
+
+/**
+ * Cleanup function to reset scanning states when extension is reloaded
+ */
+async function cleanupOnStartup() {
+  try {
+    console.log('Performing startup cleanup...');
+
+    // Reset all scanning states
+    const cleanState = {
+      isScanning: false,
+      progress: 0,
+      message: '',
+      step: '',
+      startTime: null,
+      options: null
+    };
+
+    // Reset both scanning states
+    subscriptionScanningState = { ...cleanState };
+    packageScanningState = { ...cleanState };
+
+    // Clear stored scanning states
+    await chrome.storage.local.remove(['subscriptionScanningState', 'packageScanningState']);
+
+    // Destroy any existing LLM session
+    try {
+      if (typeof llmExtractor !== 'undefined' && llmExtractor) {
+        await llmExtractor.destroySession();
+        console.log('LLM session destroyed during cleanup');
+      }
+    } catch (error) {
+      console.warn('Error destroying LLM session during cleanup:', error);
+    }
+
+    // Send cleanup message to all tabs to reset UI
+    const tabs = await chrome.tabs.query({});
+    const cleanupMessage = {
+      type: MESSAGE_TYPES.CLEANUP_SCAN_STATES,
+      data: {
+        step: 'cleanup',
+        progress: 0,
+        message: 'Extension reloaded - resetting scan states',
+        scanType: 'cleanup'
+      }
+    };
+
+    tabs.forEach(tab => {
+      chrome.tabs.sendMessage(tab.id, cleanupMessage).catch(() => {
+        // Ignore errors if content script not available
+      });
+    });
+
+    // Also send to popup if open
+    chrome.runtime.sendMessage(cleanupMessage).catch(() => {
+      // Ignore errors if popup is closed
+    });
+
+    console.log('Startup cleanup completed');
+  } catch (error) {
+    console.error('Error during startup cleanup:', error);
+  }
+}
 
 /**
  * Gmail API integration class for searching and fetching emails
@@ -356,14 +440,18 @@ class LLMExtractor {
     try {
       // Check if LanguageModel API is available
       if (typeof LanguageModel === 'undefined' || !LanguageModel) {
-        throw new Error('LanguageModel API not available. Enable Chrome AI features.');
+        throw new Error('Chrome AI not available. Please enable "Prompt API for Gemini Nano" in chrome://flags and restart Chrome.');
       }
 
       const availability = await LanguageModel.availability();
       console.log('LanguageModel availability:', availability);
 
       if (availability === 'no') {
-        throw new Error(ERROR_MESSAGES.LLM_NOT_AVAILABLE);
+        throw new Error('Chrome AI not available on this device. Please enable "Prompt API for Gemini Nano" in chrome://flags and restart Chrome.');
+      }
+
+      if (availability === 'after-download') {
+        throw new Error('Chrome AI model needs to be downloaded first. Please wait for the download to complete and try again.');
       }
 
       console.log('LLM Extractor initialized with LanguageModel API');
@@ -400,16 +488,17 @@ class LLMExtractor {
         await this.initialize();
       }
 
-      // Check LanguageModel availability
       const availability = await LanguageModel.availability();
       if (availability !== 'available') {
-        throw new Error(`LanguageModel not available: ${availability}`);
+        throw new Error(`Chrome AI not ready: ${availability}. Please ensure Chrome AI is properly enabled.`);
       }
 
       // Create new session if none exists
       if (!this.currentSession) {
         console.log('Creating new LLM session');
-        this.currentSession = await LanguageModel.create({
+
+        // Add timeout to session creation
+        const createPromise = LanguageModel.create({
           temperature: LLM_CONFIG.TEMPERATURE,
           topK: LLM_CONFIG.TOP_K,
           initialPrompts: [
@@ -419,6 +508,8 @@ class LLMExtractor {
             }
           ]
         });
+
+        this.currentSession = await createPromise;
       }
 
       return this.currentSession;
@@ -434,6 +525,7 @@ class LLMExtractor {
   async callLLM(prompt) {
     try {
       const session = await this.getSession();
+
       const result = await session.prompt(prompt);
       return result;
     } catch (error) {
@@ -489,6 +581,18 @@ class PackageDatabase {
             store.createIndex(PACKAGE_SCHEMA.EMAIL_ID, PACKAGE_SCHEMA.EMAIL_ID, { unique: false });
           }
 
+          // Create subscriptions store if it doesn't exist
+          if (!db.objectStoreNames.contains(PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME)) {
+            const subscriptionStore = db.createObjectStore(PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME, {
+              keyPath: SUBSCRIPTION_SCHEMA.ID
+            });
+
+            // Create indexes for subscriptions
+            subscriptionStore.createIndex(SUBSCRIPTION_SCHEMA.USER_EMAIL, SUBSCRIPTION_SCHEMA.USER_EMAIL, { unique: false });
+            subscriptionStore.createIndex(SUBSCRIPTION_SCHEMA.BILLING_DATE, SUBSCRIPTION_SCHEMA.BILLING_DATE, { unique: false });
+            subscriptionStore.createIndex(SUBSCRIPTION_SCHEMA.EMAIL_ID, SUBSCRIPTION_SCHEMA.EMAIL_ID, { unique: false });
+          }
+
           // Create scan history store if it doesn't exist
           if (!db.objectStoreNames.contains(PACKAGE_CONFIG.SCAN_HISTORY_STORE_NAME)) {
             const scanHistoryStore = db.createObjectStore(PACKAGE_CONFIG.SCAN_HISTORY_STORE_NAME, {
@@ -501,12 +605,42 @@ class PackageDatabase {
             scanHistoryStore.createIndex(SCAN_HISTORY_SCHEMA.LATEST_EMAIL_TIMESTAMP, SCAN_HISTORY_SCHEMA.LATEST_EMAIL_TIMESTAMP, { unique: false });
           }
 
+          // Create subscription scan history store if it doesn't exist
+          if (!db.objectStoreNames.contains(PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME)) {
+            const subscriptionScanHistoryStore = db.createObjectStore(PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME, {
+              keyPath: SUBSCRIPTION_SCAN_HISTORY_SCHEMA.ID
+            });
+
+            // Create indexes for subscription scan history
+            subscriptionScanHistoryStore.createIndex(SUBSCRIPTION_SCAN_HISTORY_SCHEMA.SCAN_DATE, SUBSCRIPTION_SCAN_HISTORY_SCHEMA.SCAN_DATE, { unique: false });
+            subscriptionScanHistoryStore.createIndex(SUBSCRIPTION_SCAN_HISTORY_SCHEMA.START_DATE, SUBSCRIPTION_SCAN_HISTORY_SCHEMA.START_DATE, { unique: false });
+            subscriptionScanHistoryStore.createIndex(SUBSCRIPTION_SCAN_HISTORY_SCHEMA.END_DATE, SUBSCRIPTION_SCAN_HISTORY_SCHEMA.END_DATE, { unique: false });
+          }
+
+          // Create subscription calendar events store if it doesn't exist
+          if (!db.objectStoreNames.contains(PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME)) {
+            const subscriptionCalendarEventsStore = db.createObjectStore(PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME, {
+              keyPath: SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.ID
+            });
+
+            // Create indexes for subscription calendar events
+            subscriptionCalendarEventsStore.createIndex(SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_ID, SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_ID, { unique: false });
+            subscriptionCalendarEventsStore.createIndex(SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.SUBSCRIPTION_NAME, SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.SUBSCRIPTION_NAME, { unique: false });
+            subscriptionCalendarEventsStore.createIndex(SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.CREATED_DATE, SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.CREATED_DATE, { unique: false });
+          }
+
           // Handle version upgrades
           if (oldVersion < 2) {
             console.log('Upgraded database schema to include email details fields');
           }
           if (oldVersion < 3) {
             console.log('Upgraded database schema to include scan history');
+          }
+          if (oldVersion < 4) {
+            console.log('Upgraded database schema to include subscriptions');
+          }
+          if (oldVersion < 5) {
+            console.log('Upgraded database schema to include subscription scan history and calendar events tracking');
           }
         };
       });
@@ -884,6 +1018,620 @@ class PackageDatabase {
     }
   }
 
+  /**
+   * Save subscription to database
+   */
+  async saveSubscriptionToDB(subscriptionData) {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME);
+
+        const subscriptionRecord = {
+          [SUBSCRIPTION_SCHEMA.ID]: `${subscriptionData.emailId}_${Date.now()}`,
+          [SUBSCRIPTION_SCHEMA.USER_EMAIL]: subscriptionData.userEmail,
+          [SUBSCRIPTION_SCHEMA.SUBSCRIPTION_NAME]: subscriptionData.subscriptionName,
+          [SUBSCRIPTION_SCHEMA.AMOUNT]: subscriptionData.amount,
+          [SUBSCRIPTION_SCHEMA.BILLING_DATE]: subscriptionData.billingDate,
+          [SUBSCRIPTION_SCHEMA.REMINDER_DATE]: subscriptionData.reminderDate,
+          [SUBSCRIPTION_SCHEMA.EMAIL_ID]: subscriptionData.emailId,
+          [SUBSCRIPTION_SCHEMA.EMAIL_SUBJECT]: subscriptionData.emailSubject || '',
+          [SUBSCRIPTION_SCHEMA.EMAIL_FROM]: subscriptionData.emailFrom || '',
+          [SUBSCRIPTION_SCHEMA.CREATED_AT]: new Date().toISOString()
+        };
+
+        const request = store.add(subscriptionRecord);
+
+        request.onsuccess = () => {
+          console.log('Subscription saved to database:', subscriptionRecord.id);
+          resolve(subscriptionRecord);
+        };
+
+        request.onerror = () => {
+          console.error('Failed to save subscription:', request.error);
+          reject(new Error('Failed to save subscription'));
+        };
+      });
+    } catch (error) {
+      console.error('Save subscription error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all subscriptions from database
+   */
+  async getSubscriptions() {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME], 'readonly');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_STORE_NAME);
+
+        const request = store.getAll();
+
+        request.onsuccess = () => {
+          // Sort by billing date (newest first)
+          const subscriptions = request.result.sort((a, b) =>
+            new Date(b[SUBSCRIPTION_SCHEMA.BILLING_DATE]) - new Date(a[SUBSCRIPTION_SCHEMA.BILLING_DATE])
+          );
+          resolve(subscriptions);
+        };
+
+        request.onerror = () => {
+          console.error('Failed to fetch subscriptions:', request.error);
+          reject(new Error('Failed to fetch subscriptions'));
+        };
+      });
+    } catch (error) {
+      console.error('Get subscriptions error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Save subscription scan history
+   */
+  async saveSubscriptionScanHistory(scanData) {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME);
+
+        const scanRecord = {
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.ID]: `sub_scan_${Date.now()}`,
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.SCAN_DATE]: new Date().toISOString(),
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.START_DATE]: scanData.startDate,
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.END_DATE]: scanData.endDate,
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.EMAILS_SCANNED]: scanData.emailsScanned,
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.SUBSCRIPTIONS_FOUND]: scanData.subscriptionsFound,
+          [SUBSCRIPTION_SCAN_HISTORY_SCHEMA.CALENDAR_EVENTS_CREATED]: scanData.calendarEventsCreated
+        };
+
+        const request = store.add(scanRecord);
+
+        request.onsuccess = () => {
+          console.log('Subscription scan history saved:', scanRecord.id);
+          resolve(scanRecord);
+        };
+
+        request.onerror = () => {
+          console.error('Failed to save subscription scan history:', request.error);
+          reject(new Error('Failed to save subscription scan history'));
+        };
+      });
+    } catch (error) {
+      console.error('Save subscription scan history error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get latest subscription scan date
+   */
+  async getLatestSubscriptionScanDate() {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME], 'readonly');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_SCAN_HISTORY_STORE_NAME);
+        const index = store.index(SUBSCRIPTION_SCAN_HISTORY_SCHEMA.SCAN_DATE);
+
+        const request = index.openCursor(null, 'prev');
+
+        request.onsuccess = () => {
+          const cursor = request.result;
+          if (cursor) {
+            resolve(cursor.value[SUBSCRIPTION_SCAN_HISTORY_SCHEMA.END_DATE]);
+          } else {
+            resolve(null);
+          }
+        };
+
+        request.onerror = () => {
+          console.error('Failed to get latest subscription scan date:', request.error);
+          resolve(null);
+        };
+      });
+    } catch (error) {
+      console.error('Get latest subscription scan date error:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Check if calendar event already exists for email
+   */
+  async calendarEventExists(emailId) {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME], 'readonly');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME);
+        const index = store.index(SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_ID);
+
+        const request = index.get(emailId);
+
+        request.onsuccess = () => {
+          resolve(!!request.result);
+        };
+
+        request.onerror = () => {
+          console.error('Failed to check calendar event exists:', request.error);
+          resolve(false);
+        };
+      });
+    } catch (error) {
+      console.error('Check calendar event exists error:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Save calendar event record
+   */
+  async saveCalendarEventRecord(eventData) {
+    try {
+      if (!this.db) await this.initDB();
+
+      return new Promise((resolve, reject) => {
+        const transaction = this.db.transaction([PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME], 'readwrite');
+        const store = transaction.objectStore(PACKAGE_CONFIG.SUBSCRIPTION_CALENDAR_EVENTS_STORE_NAME);
+
+        const eventRecord = {
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.ID]: `cal_event_${Date.now()}`,
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_ID]: eventData.emailId,
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.SUBSCRIPTION_NAME]: eventData.subscriptionName,
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.CALENDAR_EVENT_ID]: eventData.calendarEventId,
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.CREATED_DATE]: new Date().toISOString(),
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_SUBJECT]: eventData.emailSubject,
+          [SUBSCRIPTION_CALENDAR_EVENTS_SCHEMA.EMAIL_FROM]: eventData.emailFrom
+        };
+
+        const request = store.add(eventRecord);
+
+        request.onsuccess = () => {
+          console.log('Calendar event record saved:', eventRecord.id);
+          resolve(eventRecord);
+        };
+
+        request.onerror = () => {
+          console.error('Failed to save calendar event record:', request.error);
+          reject(new Error('Failed to save calendar event record'));
+        };
+      });
+    } catch (error) {
+      console.error('Save calendar event record error:', error);
+      throw error;
+    }
+  }
+
+}
+
+/**
+ * Subscription Tracker - Main orchestrator for subscription tracking
+ */
+class SubscriptionTracker {
+  constructor(gmailScanner, llmExtractor, calendarManager, packageDB) {
+    this.gmailScanner = gmailScanner;
+    this.llmExtractor = llmExtractor;
+    this.calendarManager = calendarManager;
+    this.packageDB = packageDB;
+  }
+
+  /**
+   * Scan current month subscription emails and create calendar reminders
+   */
+  async scanCurrentMonthSubscriptions(progressCallback = null) {
+    try {
+      // Get the last scan date to optimize scanning
+      const lastScanDate = await this.packageDB.getLatestSubscriptionScanDate();
+      
+      let startDate, endDate;
+      if (lastScanDate) {
+        // Scan from last scan date to now
+        startDate = lastScanDate;
+        endDate = new Date().toISOString().split('T')[0];
+        console.log(`Incremental scan from ${startDate} to ${endDate}`);
+      } else {
+        // First time scan - scan current month
+        const now = new Date();
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+        endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+        console.log(`Initial scan from ${startDate} to ${endDate}`);
+      }
+
+      // Define keywords for filtering
+      const subscriptionSpecificKeywords = ['subscription', 'renewal', 'monthly subscription', 'annual subscription'];
+
+      if (progressCallback) progressCallback({ step: 'subscription_scan', progress: 10, message: 'Searching for subscription emails...' });
+
+      // Search for subscription-related emails
+      const emailIds = await this.searchSubscriptionEmails({ startDate, endDate });
+
+      if (emailIds.length === 0) {
+        if (progressCallback) progressCallback({ step: 'complete', progress: 100, message: 'No subscription emails found' });
+        return [];
+      }
+
+      if (progressCallback) progressCallback({ step: 'subscription_scan', progress: 30, message: `Processing ${emailIds.length} subscription emails...` });
+
+      const subscriptions = [];
+      const totalEmails = emailIds.length;
+      let processedEmails = 0;
+      let analyzedEmails = 0;
+
+      for (let i = 0; i < emailIds.length; i++) {
+        const emailId = emailIds[i];
+        processedEmails++;
+        const emailProgress = 30 + (processedEmails / totalEmails) * 50;
+
+        try {
+          if (progressCallback) {
+            progressCallback({
+              step: 'subscription_scan',
+              progress: Math.round(emailProgress),
+              message: `Processing email ${processedEmails}/${totalEmails}...`
+            });
+          }
+
+          // Fetch email content
+          const email = await this.gmailScanner.fetchEmail(emailId);
+
+          // Pre-filter: Check if this email is likely subscription-related before sending to LLM
+          if (!this.isLikelySubscriptionEmail(email, subscriptionSpecificKeywords)) {
+            console.log(`Filtered out email: "${email.subject}" - not subscription-related`);
+            continue; // Skip this email
+          }
+
+          analyzedEmails++;
+          if (progressCallback) {
+            progressCallback({
+              step: 'subscription_scan',
+              progress: Math.round(emailProgress),
+              message: `Analyzing subscription email ${analyzedEmails} (${processedEmails}/${totalEmails} processed)`
+            });
+          }
+
+          // Extract subscription information using LLM
+          const subscriptionInfo = await this.extractSubscriptionInfo(email.body || email.snippet || '', email.from, email.subject, email.date);
+
+          if (subscriptionInfo.isSubscriptionEmail) {
+            const billingDate = new Date(subscriptionInfo.billingDate);
+            const reminderDate = new Date(billingDate);
+            reminderDate.setMonth(reminderDate.getMonth() + 1);
+
+            const subscriptionData = {
+              userEmail: await this.getCurrentUserEmail(),
+              subscriptionName: subscriptionInfo.subscriptionName,
+              amount: subscriptionInfo.amount,
+              billingDate: subscriptionInfo.billingDate,
+              reminderDate: reminderDate.toISOString().split('T')[0],
+              emailId: emailId,
+              emailSubject: email.subject,
+              emailFrom: email.from
+            };
+
+            // Save to database
+            const savedSubscription = await this.packageDB.saveSubscriptionToDB(subscriptionData);
+
+            subscriptions.push({
+              ...subscriptionInfo,
+              emailId: emailId,
+              emailDate: email.date,
+              emailSubject: email.subject,
+              emailFrom: email.from
+            });
+          }
+
+        } catch (emailError) {
+          console.error(`Failed to process email ${emailId}:`, emailError);
+        }
+      }
+
+      if (progressCallback) progressCallback({ step: 'subscription_scan', progress: 80, message: `Creating calendar events for ${subscriptions.length} subscriptions...` });
+
+      // Create calendar events for subscriptions (check for duplicates)
+      const createdEvents = [];
+      for (let i = 0; i < subscriptions.length; i++) {
+        const subscription = subscriptions[i];
+        try {
+          // Check if calendar event already exists for this email
+          const eventExists = await this.packageDB.calendarEventExists(subscription.emailId);
+          if (eventExists) {
+            console.log(`Calendar event already exists for email ${subscription.emailId}, skipping`);
+            continue;
+          }
+
+          const event = await this.createSubscriptionReminderEvent(subscription);
+          
+          // Save calendar event record to prevent duplicates
+          await this.packageDB.saveCalendarEventRecord({
+            emailId: subscription.emailId,
+            subscriptionName: subscription.subscriptionName,
+            calendarEventId: event.id,
+            emailSubject: subscription.emailSubject,
+            emailFrom: subscription.emailFrom
+          });
+          
+          createdEvents.push(event);
+        } catch (eventError) {
+          console.error(`Failed to create calendar event for subscription:`, eventError);
+        }
+      }
+
+      if (progressCallback) {
+        progressCallback({
+          step: 'complete',
+          progress: 100,
+          message: `Created ${createdEvents.length} subscription reminders`
+        });
+      }
+
+      // Save subscription scan history
+      try {
+        await this.packageDB.saveSubscriptionScanHistory({
+          startDate: startDate,
+          endDate: endDate,
+          emailsScanned: emailIds.length,
+          subscriptionsFound: subscriptions.length,
+          calendarEventsCreated: createdEvents.length
+        });
+      } catch (historyError) {
+        console.error('Failed to save subscription scan history:', historyError);
+      }
+
+      // Don't clear progress here - let the progress callback handle it
+
+      return createdEvents;
+
+    } catch (error) {
+      console.error('Scan subscriptions error:', error);
+      if (progressCallback) {
+        progressCallback({
+          step: 'error',
+          progress: 0,
+          message: `Error: ${error.message}`
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Pre-filter to check if email is likely subscription-related
+   * Only uses subscription-specific keywords and subject filtering
+   */
+  isLikelySubscriptionEmail(email, subscriptionKeywords) {
+    const subject = (email.subject || '').toLowerCase();
+    const fullContent = (email.snippet || '').toLowerCase();
+
+    // Check if subject contains subscription or plan
+    const hasSubscriptionSubject = subject.includes('subscription') || subject.includes('plan');
+
+    // Check if content contains subscription-specific keywords
+    const hasSubscriptionContent = subscriptionKeywords.some(keyword =>
+      fullContent.includes(keyword.toLowerCase())
+    );
+
+    // Allow if: subscription content OR subscription/plan in subject
+    return hasSubscriptionContent || hasSubscriptionSubject;
+  }
+
+  /**
+   * Search for subscription-related emails
+   */
+  async searchSubscriptionEmails(options = {}) {
+    try {
+      const { startDate, endDate } = options;
+      const keywords = SUBSCRIPTION_CONFIG.DEFAULT_SEARCH_KEYWORDS;
+
+      console.log('Searching subscription emails from', startDate, 'to', endDate);
+
+      // Build more restrictive search query for subscription emails
+      const subscriptionSpecificKeywords = ['subscription', 'renewal', 'monthly subscription', 'annual subscription'];
+
+      const searchOptions = {
+        newerThan: startDate,
+        olderThan: endDate
+      };
+
+      // Override the buildSearchQuery to be more restrictive
+      const originalBuildQuery = this.gmailScanner.buildSearchQuery;
+      this.gmailScanner.buildSearchQuery = (newerThan, olderThan) => {
+        // Build the query components - only use subscription keywords and subject filter in Gmail search
+        const subjectQuery = 'subject:(subscription OR plan or membership or renewal)';
+        const subscriptionContentQuery = subscriptionSpecificKeywords.map(keyword => `"${keyword}"`).join(' OR ');
+
+        // Use subscription-specific content OR subscription/plan in subject (payment filtering will be done on snippets later)
+        let query = `((${subscriptionContentQuery}) OR ${subjectQuery})`;
+
+        if (newerThan) {
+          const date = new Date(newerThan);
+          const dateStr = date.toISOString().split('T')[0].replace(/-/g, '/');
+          query += ` after:${dateStr}`;
+        }
+
+        if (olderThan) {
+          const date = new Date(olderThan);
+          const dateStr = date.toISOString().split('T')[0].replace(/-/g, '/');
+          query += ` before:${dateStr}`;
+        }
+
+        query += ` ${SEARCH_QUERIES.SPAM_FILTER}`;
+        console.log('Subscription search query:', query);
+        return query;
+      };
+
+      const emailIds = await this.gmailScanner.searchEmails(searchOptions);
+
+      // Restore original method
+      this.gmailScanner.buildSearchQuery = originalBuildQuery;
+
+      console.log(`Found ${emailIds.length} potential subscription emails`);
+      return emailIds;
+    } catch (error) {
+      console.error('Search subscription emails error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Extract subscription information from email content using LLM
+   */
+  async extractSubscriptionInfo(emailContent, emailFrom, emailSubject, emailDate = null) {
+    try {
+      const prompt = `Analyze the following email and determine if it is a subscription billing/payment notification email.
+
+Email from: ${emailFrom}
+Email subject: ${emailSubject}
+Email content:
+${emailContent}
+
+Return ONLY a valid JSON object with the following structure:
+{
+  "isSubscriptionEmail": boolean,
+  "subscriptionName": "service name (e.g., 'Netflix', 'Spotify', 'Adobe') or null if not a subscription email",
+  "amount": "payment amount with currency (e.g., '$9.99', '€12.50') or null if not found",
+  "billingDate": "YYYY-MM-DD format of when this payment was processed, or null if not found"
+}
+
+Rules:
+- Set isSubscriptionEmail to true ONLY if the email is clearly about an ACTUAL subscription payment, billing, or renewal that has already been charged
+- Set isSubscriptionEmail to false for ALL of the following:
+  * Advertisement emails (e.g., "Get 3 months free", "Redeem your trial", "Special offer")
+  * Trial offers or promotional emails
+  * Emails about starting new subscriptions or trials
+  * Emails that mention "free", "trial", "offer", "redeem", "discount", "promo"
+  * Emails that are trying to sell or promote services
+- If isSubscriptionEmail is false, set all other fields to null
+- For subscriptionName, extract the service/company name (e.g., "Netflix" from "Netflix.com" or "Your Netflix subscription")
+- For amount, include currency symbol and amount (e.g., "$9.99", "€12.50")
+- For billingDate, use YYYY-MM-DD format based on the payment/billing date mentioned in the email
+- Do not include any explanatory text, markdown formatting, or code blocks
+- Return only the raw JSON object`;
+      console.log("Email subject:", emailSubject);
+      console.log("Email conetent:", emailContent)
+      const response = await this.llmExtractor.callLLM(prompt);
+
+      const cleanedResponse = response
+        .replace(/```json\s*/g, '')
+        .replace(/```\s*/g, '')
+        .replace(/^\s*[\r\n]+/gm, '')
+        .trim();
+
+      const subscriptionInfo = JSON.parse(cleanedResponse);
+      console.log("Subscription info extracted:", JSON.stringify(subscriptionInfo));
+
+      return {
+        isSubscriptionEmail: subscriptionInfo.isSubscriptionEmail,
+        subscriptionName: subscriptionInfo.subscriptionName,
+        amount: subscriptionInfo.amount,
+        billingDate: subscriptionInfo.billingDate || (emailDate ? new Date(emailDate).toISOString().split('T')[0] : null),
+        emailSubject: emailSubject
+      };
+    } catch (error) {
+      console.error('Extract subscription info error:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get current user's email address
+   */
+  async getCurrentUserEmail() {
+    try {
+      const token = await this.gmailScanner.getAuthToken();
+      const response = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (response.ok) {
+        const profile = await response.json();
+        return profile.emailAddress || 'unknown@gmail.com';
+      }
+      return 'unknown@gmail.com';
+    } catch (error) {
+      console.error('Failed to get user email:', error);
+      return 'unknown@gmail.com';
+    }
+  }
+
+  /**
+   * Create calendar event for subscription reminder (1 month from billing date)
+   */
+  async createSubscriptionReminderEvent(subscription) {
+    try {
+      const billingDate = new Date(subscription.billingDate);
+
+      // Create reminder for 1 month after the billing date
+      const reminderDate = new Date(billingDate);
+      reminderDate.setMonth(reminderDate.getMonth() + 1);
+
+      const reminderDateStr = reminderDate.toISOString().split('T')[0];
+
+      const eventTitle = `${subscription.subscriptionName} Subscription Renewal`;
+      const gmailUrl = `https://mail.google.com/mail/u/0/#inbox/${subscription.emailId}`;
+      const eventDescription = `Subscription renewal reminder for ${subscription.subscriptionName}
+Amount: ${subscription.amount || 'N/A'}
+Last billing: ${subscription.billingDate}
+Original email: ${subscription.emailSubject}
+View original email: ${gmailUrl}`;
+
+      const eventData = {
+        title: eventTitle,
+        date: reminderDateStr,
+        description: eventDescription
+      };
+
+      const event = await this.calendarManager.createEvent(eventData);
+      console.log(`Created calendar event for ${subscription.subscriptionName} on ${reminderDateStr}`);
+
+      const result = {
+        id: event.id,
+        subscriptionName: subscription.subscriptionName,
+        amount: subscription.amount,
+        reminderDate: reminderDateStr,
+        calendarEventId: event.id
+      };
+      
+      console.log('Returning subscription event:', result);
+      return result;
+    } catch (error) {
+      console.error('Create subscription reminder event error:', error);
+      throw error;
+    }
+  }
 }
 
 /**
@@ -1245,8 +1993,8 @@ Rules:
   }
 }
 
-// Scanning state management
-let currentScanningState = {
+// Separate scanning state management for subscription and package scans
+let subscriptionScanningState = {
   isScanning: false,
   progress: 0,
   message: '',
@@ -1255,256 +2003,541 @@ let currentScanningState = {
   options: null
 };
 
+let packageScanningState = {
+  isScanning: false,
+  progress: 0,
+  message: '',
+  step: '',
+  startTime: null,
+  options: null
+};
+
+// Load scanning states from storage on startup
+async function loadScanningStates() {
+  try {
+    const result = await chrome.storage.local.get(['subscriptionScanningState', 'packageScanningState']);
+
+    // Load subscription scanning state
+    if (result.subscriptionScanningState) {
+      const storedState = result.subscriptionScanningState;
+      const tenMinutes = 10 * 60 * 1000;
+      if (Date.now() - storedState.timestamp < tenMinutes && storedState.isScanning) {
+        subscriptionScanningState = { ...storedState };
+        console.log('Restored subscription scanning state from storage:', subscriptionScanningState);
+      } else {
+        console.log('Subscription scanning state expired or not active, starting fresh');
+      }
+    }
+
+    // Load package scanning state
+    if (result.packageScanningState) {
+      const storedState = result.packageScanningState;
+      const tenMinutes = 10 * 60 * 1000;
+      if (Date.now() - storedState.timestamp < tenMinutes && storedState.isScanning) {
+        packageScanningState = { ...storedState };
+        console.log('Restored package scanning state from storage:', packageScanningState);
+      } else {
+        console.log('Package scanning state expired or not active, starting fresh');
+      }
+    }
+  } catch (error) {
+    console.error('Failed to load scanning states:', error);
+  }
+}
+
+// Save scanning states to storage
+async function saveScanningStates() {
+  try {
+    await chrome.storage.local.set({
+      subscriptionScanningState: {
+        ...subscriptionScanningState,
+        timestamp: Date.now()
+      },
+      packageScanningState: {
+        ...packageScanningState,
+        timestamp: Date.now()
+      }
+    });
+  } catch (error) {
+    console.error('Failed to save scanning states:', error);
+  }
+}
+
+// Initialize scanning states on startup
+loadScanningStates();
+
 // Create global instances
 const gmailScanner = new GmailScanner();
 const calendarManager = new CalendarManager();
 const llmExtractor = new LLMExtractor();
 const packageDB = new PackageDatabase();
 const packageTracker = new PackageTracker(gmailScanner, llmExtractor, packageDB);
+const subscriptionTracker = new SubscriptionTracker(gmailScanner, llmExtractor, calendarManager, packageDB);
 
 // Message handling for all functions including package tracking
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  switch (message.type) {
-    case MESSAGE_TYPES.SEARCH_EMAILS:
-      gmailScanner.searchEmails(message.options)
-        .then(emailIds => sendResponse({ success: true, emailIds }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
+  console.log('Background: Received message:', message.type);
 
-    case MESSAGE_TYPES.FETCH_EMAIL:
-      gmailScanner.fetchEmail(message.emailId)
-        .then(email => sendResponse({ success: true, email }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
+  // Always return true to indicate we will send a response asynchronously
+  handleMessage(message, sender, sendResponse);
+  return true;
+});
 
-    case MESSAGE_TYPES.CREATE_CALENDAR_EVENT:
-      calendarManager.createEvent(message.eventData)
-        .then(event => sendResponse({ success: true, event }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.CALL_LLM:
-      llmExtractor.callLLM(message.prompt)
-        .then(result => sendResponse({ success: true, result }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    // Package tracking message handlers
-    case MESSAGE_TYPES.SEARCH_PACKAGE_EMAILS:
-      packageTracker.searchPackageEmails(message.options)
-        .then(emailIds => sendResponse({ success: true, emailIds }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.PROCESS_PACKAGE_EMAILS:
-      // Check if already scanning
-      if (currentScanningState.isScanning) {
-        sendResponse({ success: false, error: 'Scan already in progress' });
+async function handleMessage(message, sender, sendResponse) {
+  try {
+    switch (message.type) {
+      case MESSAGE_TYPES.SEARCH_EMAILS:
+        gmailScanner.searchEmails(message.options)
+          .then(emailIds => sendResponse({ success: true, emailIds }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
         return true;
-      }
 
-      // Initialize scanning state
-      currentScanningState = {
-        isScanning: true,
-        progress: 0,
-        message: 'Initializing...',
-        step: 'initializing',
-        startTime: Date.now(),
-        options: message.options
-      };
+      case MESSAGE_TYPES.FETCH_EMAIL:
+        gmailScanner.fetchEmail(message.emailId)
+          .then(email => sendResponse({ success: true, email }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
 
-      // Immediately broadcast that scanning has started
-      const initialStateMessage = {
-        type: 'SCANNING_STATE_CHANGED',
-        data: {
+      case MESSAGE_TYPES.CREATE_CALENDAR_EVENT:
+        calendarManager.createEvent(message.eventData)
+          .then(event => sendResponse({ success: true, event }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.CALL_LLM:
+        llmExtractor.callLLM(message.prompt)
+          .then(result => sendResponse({ success: true, result }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      // Package tracking message handlers
+      case MESSAGE_TYPES.SEARCH_PACKAGE_EMAILS:
+        packageTracker.searchPackageEmails(message.options)
+          .then(emailIds => sendResponse({ success: true, emailIds }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.PROCESS_PACKAGE_EMAILS:
+        // Check if already scanning packages
+        if (packageScanningState.isScanning) {
+          sendResponse({ success: false, error: 'Package scan already in progress' });
+          return true;
+        }
+
+        // Initialize package scanning state
+        packageScanningState = {
           isScanning: true,
           progress: 0,
           message: 'Initializing...',
-          step: 'initializing'
-        }
-      };
+          step: 'initializing',
+          startTime: Date.now(),
+          options: message.options
+        };
 
-      chrome.runtime.sendMessage(initialStateMessage).catch(() => {});
-      chrome.tabs.query({}, (tabs) => {
-        tabs.forEach(tab => {
-          chrome.tabs.sendMessage(tab.id, initialStateMessage).catch(() => {});
+        // Save scanning states
+        await saveScanningStates();
+
+        // Immediately broadcast that scanning has started
+        const initialStateMessage = {
+          type: 'SCANNING_STATE_CHANGED',
+          data: {
+            isScanning: true,
+            progress: 0,
+            message: 'Initializing...',
+            step: 'initializing',
+            scanType: 'package'
+          }
+        };
+
+        chrome.runtime.sendMessage(initialStateMessage).catch(() => { });
+        chrome.tabs.query({}, (tabs) => {
+          tabs.forEach(tab => {
+            chrome.tabs.sendMessage(tab.id, initialStateMessage).catch(() => { });
+          });
         });
-      });
 
-      // Handle progress updates via chrome.runtime.sendMessage to popup and content script
-      const progressCallback = (progressData) => {
-        // Update internal state
-        currentScanningState.progress = progressData.progress || 0;
-        currentScanningState.message = progressData.message || '';
-        currentScanningState.step = progressData.step || '';
+        // Handle progress updates via chrome.runtime.sendMessage to popup and content script
+        const progressCallback = (progressData) => {
+          // Update internal package scanning state
+          packageScanningState.progress = progressData.progress || 0;
+          packageScanningState.message = progressData.message || '';
+          packageScanningState.step = progressData.step || '';
 
-        // Broadcast to all listeners (popup and content script)
-        const updateMessage = {
+          // Save updated scanning states
+          saveScanningStates();
+
+          // Store progress in chrome.storage for popup to read
+          if (progressData.step !== 'complete' && progressData.step !== 'error') {
+            chrome.storage.local.set({
+              'currentPackageProgress': progressData
+            }).catch(() => {
+              // Ignore storage errors
+            });
+          } else {
+            // For completion/error states, store briefly then clear
+            chrome.storage.local.set({
+              'currentPackageProgress': progressData
+            }).then(() => {
+              // Clear after a short delay to allow UI to show completion
+              setTimeout(() => {
+                chrome.storage.local.remove('currentPackageProgress').catch(() => {});
+              }, 2000);
+            }).catch(() => {});
+          }
+
+          // Broadcast to all listeners (popup and content script)
+          const updateMessage = {
+            type: MESSAGE_TYPES.PROGRESS_UPDATE,
+            data: progressData
+          };
+
+          // Send to all content scripts
+          chrome.tabs.query({}, (tabs) => {
+            tabs.forEach(tab => {
+              chrome.tabs.sendMessage(tab.id, updateMessage).catch(() => {
+                // Ignore errors if content script not available
+              });
+            });
+          });
+
+          // Also broadcast scanning state change
+          const stateMessage = {
+            type: 'SCANNING_STATE_CHANGED',
+            data: {
+              isScanning: packageScanningState.isScanning,
+              progress: packageScanningState.progress,
+              message: packageScanningState.message,
+              step: packageScanningState.step,
+              scanType: 'package'
+            }
+          };
+
+          chrome.runtime.sendMessage(stateMessage).catch(() => { });
+          chrome.tabs.query({}, (tabs) => {
+            tabs.forEach(tab => {
+              chrome.tabs.sendMessage(tab.id, stateMessage).catch(() => { });
+            });
+          });
+        };
+
+        // Ensure database is initialized before starting package scan
+        packageDB.initDB()
+          .then(() => {
+            console.log('Database initialized for package scan');
+            return packageTracker.processPackageEmails(message.options, progressCallback);
+          })
+          .then(packages => {
+            // Reset package scanning state
+            packageScanningState.isScanning = false;
+            saveScanningStates();
+
+            // Don't clear progress here - let the progress callback handle it with proper timing
+
+            // Broadcast final state change
+            const finalStateMessage = {
+              type: 'SCANNING_STATE_CHANGED',
+              data: {
+                isScanning: false,
+                progress: 100,
+                message: 'Scan complete',
+                step: 'complete',
+                scanType: 'package'
+              }
+            };
+
+            chrome.runtime.sendMessage(finalStateMessage).catch(() => { });
+            chrome.tabs.query({}, (tabs) => {
+              tabs.forEach(tab => {
+                chrome.tabs.sendMessage(tab.id, finalStateMessage).catch(() => { });
+              });
+            });
+
+            sendResponse({ success: true, packages });
+          })
+          .catch(error => {
+            // Reset package scanning state on error
+            packageScanningState.isScanning = false;
+            saveScanningStates();
+
+            // Don't clear progress here - let the progress callback handle it
+
+            // Broadcast error state change
+            const errorStateMessage = {
+              type: 'SCANNING_STATE_CHANGED',
+              data: {
+                isScanning: false,
+                progress: 0,
+                message: `Error: ${error.message}`,
+                step: 'error',
+                scanType: 'package'
+              }
+            };
+
+            chrome.runtime.sendMessage(errorStateMessage).catch(() => { });
+            chrome.tabs.query({}, (tabs) => {
+              tabs.forEach(tab => {
+                chrome.tabs.sendMessage(tab.id, errorStateMessage).catch(() => { });
+              });
+            });
+
+            sendResponse({ success: false, error: error.message });
+          });
+        return true;
+
+      case MESSAGE_TYPES.GET_UNPICKED_PACKAGES:
+        packageDB.initDB()
+          .then(() => packageDB.getUnpickedPackages())
+          .then(packages => sendResponse({ success: true, packages }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.MARK_PACKAGE_PICKED_UP:
+        packageDB.initDB()
+          .then(() => packageDB.markPackageAsPickedUp(message.packageId))
+          .then(packageRecord => sendResponse({ success: true, package: packageRecord }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.GET_PACKAGES_IN_DATE_RANGE:
+        packageDB.initDB()
+          .then(() => packageDB.getPackagesInDateRange(message.startDate, message.endDate))
+          .then(packages => sendResponse({ success: true, packages }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.CHECK_EMAIL_EXISTS:
+        packageDB.initDB()
+          .then(() => packageDB.emailExists(message.emailId))
+          .then(exists => sendResponse({ success: true, exists }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.GET_SCAN_HISTORY:
+        packageDB.initDB()
+          .then(() => packageDB.getScanHistory())
+          .then(scanHistory => sendResponse({ success: true, scanHistory }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.SAVE_SCAN_HISTORY:
+        packageDB.initDB()
+          .then(() => packageDB.saveScanHistory(message.scanData))
+          .then(scanRecord => sendResponse({ success: true, scanRecord }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.EXTRACT_DELIVERY_INFO:
+        packageTracker.extractDeliveryInfo(message.emailContent, message.emailFrom, message.emailSubject, message.emailDate)
+          .then(deliveryInfo => sendResponse({ success: true, deliveryInfo }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      case MESSAGE_TYPES.DESTROY_LLM_SESSION:
+        // Make session destruction non-blocking with timeout
+        Promise.race([
+          llmExtractor.destroySession(),
+          new Promise(resolve => setTimeout(() => resolve(), 5000)) // 5 second timeout
+        ])
+          .then(() => sendResponse({ success: true, message: 'Session destroyed' }))
+          .catch(error => {
+            console.warn('Session destruction failed, continuing anyway:', error);
+            sendResponse({ success: true, message: 'Session destruction attempted' });
+          });
+        return true;
+
+      case MESSAGE_TYPES.GET_SCANNING_STATE:
+        const stateResponse = {
+          success: true,
+          subscriptionScanningState: subscriptionScanningState,
+          packageScanningState: packageScanningState,
+          // For backward compatibility, return the active scanning state
+          scanningState: subscriptionScanningState.isScanning ? subscriptionScanningState : packageScanningState
+        };
+        sendResponse(stateResponse);
+
+        // Also broadcast current states to ensure synchronization
+        if (subscriptionScanningState.isScanning) {
+          const syncMessage = {
+            type: 'SCANNING_STATE_CHANGED',
+            data: {
+              isScanning: subscriptionScanningState.isScanning,
+              progress: subscriptionScanningState.progress,
+              message: subscriptionScanningState.message,
+              step: subscriptionScanningState.step,
+              scanType: 'subscription'
+            }
+          };
+
+          chrome.runtime.sendMessage(syncMessage).catch(() => { });
+          chrome.tabs.query({}, (tabs) => {
+            tabs.forEach(tab => {
+              chrome.tabs.sendMessage(tab.id, syncMessage).catch(() => { });
+            });
+          });
+        }
+
+        if (packageScanningState.isScanning) {
+          const syncMessage = {
+            type: 'SCANNING_STATE_CHANGED',
+            data: {
+              isScanning: packageScanningState.isScanning,
+              progress: packageScanningState.progress,
+              message: packageScanningState.message,
+              step: packageScanningState.step,
+              scanType: 'package'
+            }
+          };
+
+          chrome.runtime.sendMessage(syncMessage).catch(() => { });
+          chrome.tabs.query({}, (tabs) => {
+            tabs.forEach(tab => {
+              chrome.tabs.sendMessage(tab.id, syncMessage).catch(() => { });
+            });
+          });
+        }
+        return true;
+
+      case MESSAGE_TYPES.SCAN_SUBSCRIPTION_EMAILS:
+        console.log('Background: Received SCAN_SUBSCRIPTION_EMAILS message');
+        // Check if already scanning subscriptions
+        if (subscriptionScanningState.isScanning) {
+          console.log('Background: Subscription scan already in progress');
+          sendResponse({ success: false, error: 'Subscription scan already in progress' });
+          return true;
+        }
+
+        // Initialize subscription scanning state
+        subscriptionScanningState = {
+          isScanning: true,
+          progress: 0,
+          message: 'Initializing subscription scan...',
+          step: 'subscription_scan',
+          startTime: Date.now(),
+          options: { type: 'subscription' }
+        };
+
+        // Save scanning states
+        await saveScanningStates();
+
+        // Send immediate progress update to show the progress bar
+        const initialProgressData = {
+          progress: 0,
+          message: 'Initializing subscription scan...',
+          step: 'subscription_scan',
+          scanType: 'subscription'
+        };
+
+        const initialUpdateMessage = {
           type: MESSAGE_TYPES.PROGRESS_UPDATE,
-          data: progressData
+          data: initialProgressData
         };
 
         // Send to popup
-        chrome.runtime.sendMessage(updateMessage).catch(() => {
+        chrome.runtime.sendMessage(initialUpdateMessage).catch(() => {
           // Ignore errors if popup is closed
         });
 
         // Send to all content scripts
         chrome.tabs.query({}, (tabs) => {
           tabs.forEach(tab => {
-            chrome.tabs.sendMessage(tab.id, updateMessage).catch(() => {
+            chrome.tabs.sendMessage(tab.id, initialUpdateMessage).catch(() => {
               // Ignore errors if content script not available
             });
           });
         });
 
-        // Also broadcast scanning state change
-        const stateMessage = {
-          type: 'SCANNING_STATE_CHANGED',
-          data: {
-            isScanning: currentScanningState.isScanning,
-            progress: currentScanningState.progress,
-            message: currentScanningState.message,
-            step: currentScanningState.step
-          }
-        };
+        // Handle progress updates via chrome.runtime.sendMessage to popup and content script
+        const subscriptionProgressCallback = (progressData) => {
+          // Update internal subscription scanning state
+          subscriptionScanningState.progress = progressData.progress || 0;
+          subscriptionScanningState.message = progressData.message || '';
+          subscriptionScanningState.step = progressData.step || 'subscription_scan';
 
-        chrome.runtime.sendMessage(stateMessage).catch(() => {});
-        chrome.tabs.query({}, (tabs) => {
-          tabs.forEach(tab => {
-            chrome.tabs.sendMessage(tab.id, stateMessage).catch(() => {});
-          });
-        });
-      };
+          // Save updated scanning states
+          saveScanningStates();
 
-      packageTracker.processPackageEmails(message.options, progressCallback)
-        .then(packages => {
-          // Reset scanning state
-          currentScanningState.isScanning = false;
-          
-          // Broadcast final state change
-          const finalStateMessage = {
-            type: 'SCANNING_STATE_CHANGED',
-            data: {
-              isScanning: false,
-              progress: 100,
-              message: 'Scan complete',
-              step: 'complete'
-            }
+          // Ensure the progress data has the correct step for subscription scans
+          const enhancedProgressData = {
+            ...progressData,
+            step: progressData.step === 'complete' || progressData.step === 'error' ? progressData.step : 'subscription_scan',
+            scanType: 'subscription'
           };
-          
-          chrome.runtime.sendMessage(finalStateMessage).catch(() => {});
+
+          // Store progress in chrome.storage for popup to read
+          if (progressData.step !== 'complete' && progressData.step !== 'error') {
+            chrome.storage.local.set({
+              'currentSubscriptionProgress': enhancedProgressData
+            }).catch(() => {
+              // Ignore storage errors
+            });
+          } else {
+            // For completion/error states, store briefly then clear
+            chrome.storage.local.set({
+              'currentSubscriptionProgress': enhancedProgressData
+            }).then(() => {
+              // Clear after a short delay to allow UI to show completion
+              setTimeout(() => {
+                chrome.storage.local.remove('currentSubscriptionProgress').catch(() => {});
+              }, 2000);
+            }).catch(() => {});
+          }
+
+          // Broadcast to all listeners (popup and content script)
+          const updateMessage = {
+            type: MESSAGE_TYPES.PROGRESS_UPDATE,
+            data: enhancedProgressData
+          };
+
+          // Send to all content scripts
           chrome.tabs.query({}, (tabs) => {
             tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, finalStateMessage).catch(() => {});
+              chrome.tabs.sendMessage(tab.id, updateMessage).catch(() => {
+                // Ignore errors if content script not available
+              });
             });
           });
-          
-          sendResponse({ success: true, packages });
-        })
-        .catch(error => {
-          // Reset scanning state on error
-          currentScanningState.isScanning = false;
-          
-          // Broadcast error state change
-          const errorStateMessage = {
-            type: 'SCANNING_STATE_CHANGED',
-            data: {
-              isScanning: false,
-              progress: 0,
-              message: `Error: ${error.message}`,
-              step: 'error'
-            }
-          };
-          
-          chrome.runtime.sendMessage(errorStateMessage).catch(() => {});
-          chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, errorStateMessage).catch(() => {});
-            });
-          });
-          
-          sendResponse({ success: false, error: error.message });
-        });
-      return true;
-
-    case MESSAGE_TYPES.GET_UNPICKED_PACKAGES:
-      packageDB.getUnpickedPackages()
-        .then(packages => sendResponse({ success: true, packages }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.MARK_PACKAGE_PICKED_UP:
-      packageDB.markPackageAsPickedUp(message.packageId)
-        .then(packageRecord => sendResponse({ success: true, package: packageRecord }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.GET_PACKAGES_IN_DATE_RANGE:
-      packageDB.getPackagesInDateRange(message.startDate, message.endDate)
-        .then(packages => sendResponse({ success: true, packages }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.CHECK_EMAIL_EXISTS:
-      packageDB.emailExists(message.emailId)
-        .then(exists => sendResponse({ success: true, exists }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.GET_SCAN_HISTORY:
-      packageDB.getScanHistory()
-        .then(scanHistory => sendResponse({ success: true, scanHistory }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.SAVE_SCAN_HISTORY:
-      packageDB.saveScanHistory(message.scanData)
-        .then(scanRecord => sendResponse({ success: true, scanRecord }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.EXTRACT_DELIVERY_INFO:
-      packageTracker.extractDeliveryInfo(message.emailContent, message.emailFrom, message.emailSubject, message.emailDate)
-        .then(deliveryInfo => sendResponse({ success: true, deliveryInfo }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.DESTROY_LLM_SESSION:
-      llmExtractor.destroySession()
-        .then(() => sendResponse({ success: true, message: 'Session destroyed' }))
-        .catch(error => sendResponse({ success: false, error: error.message }));
-      return true;
-
-    case MESSAGE_TYPES.GET_SCANNING_STATE:
-      const stateResponse = { 
-        success: true, 
-        scanningState: currentScanningState 
-      };
-      sendResponse(stateResponse);
-      
-      // Also broadcast current state to ensure synchronization
-      if (currentScanningState.isScanning) {
-        const syncMessage = {
-          type: 'SCANNING_STATE_CHANGED',
-          data: {
-            isScanning: currentScanningState.isScanning,
-            progress: currentScanningState.progress,
-            message: currentScanningState.message,
-            step: currentScanningState.step
-          }
         };
-        
-        chrome.runtime.sendMessage(syncMessage).catch(() => {});
-        chrome.tabs.query({}, (tabs) => {
-          tabs.forEach(tab => {
-            chrome.tabs.sendMessage(tab.id, syncMessage).catch(() => {});
-          });
-        });
-      }
-      return true;
 
-    default:
-      sendResponse({ error: 'Unknown message type' });
+        // Ensure database is initialized before starting subscription scan
+        packageDB.initDB()
+          .then(() => {
+            console.log('Database initialized for subscription scan');
+            return subscriptionTracker.scanCurrentMonthSubscriptions(subscriptionProgressCallback);
+          })
+          .then(events => {
+            // Reset subscription scanning state
+            subscriptionScanningState.isScanning = false;
+            saveScanningStates();
+            
+            // Don't clear progress here - let the progress callback handle it with proper timing
+            
+            console.log('Background: Subscription scan completed successfully, events:', events.length);
+            sendResponse({ success: true, events });
+          })
+          .catch(error => {
+            // Reset subscription scanning state on error
+            subscriptionScanningState.isScanning = false;
+            saveScanningStates();
+            
+            // Don't clear progress here - let the progress callback handle it
+            
+            console.error('Background: Subscription scan failed:', error);
+            sendResponse({ success: false, error: error.message || 'Subscription scan failed' });
+          });
+        return true;
+
+      case MESSAGE_TYPES.GET_SUBSCRIPTIONS:
+        packageDB.initDB()
+          .then(() => packageDB.getSubscriptions())
+          .then(subscriptions => sendResponse({ success: true, subscriptions }))
+          .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+
+      default:
+        sendResponse({ success: false, error: 'Unknown message type' });
+    }
+  } catch (error) {
+    console.error('Background: Error handling message:', error);
+    sendResponse({ success: false, error: error.message || 'Background script error' });
   }
-});
+}
