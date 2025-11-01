@@ -87,6 +87,10 @@ class GmailContentScript {
     // Always create the floating widget on any website
     this.createFloatingWidget();
     
+    // IMMEDIATELY check for any ongoing scans and sync
+    await this.checkScanningState();
+    await this.pollProgressUpdates();
+    
     // Set up periodic scanning state check
     this.setupPeriodicStateCheck();
   }
@@ -909,47 +913,123 @@ class GmailContentScript {
     }
   }
 
-  // Check if scanning is already in progress
+  // Check if scanning is already in progress and sync with storage
   async checkScanningState() {
     try {
+      console.log('Content: Checking scanning state...');
+      
+      // First check background state
       const response = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.GET_SCANNING_STATE
       });
+
+      // Also check storage for current progress
+      const storageResult = await chrome.storage.local.get(['currentSubscriptionProgress', 'currentPackageProgress']);
+
+      console.log('Content: Background response:', response);
+      console.log('Content: Storage result:', storageResult);
 
       if (response.success) {
         const subscriptionActive = response.subscriptionScanningState?.isScanning || false;
         const packageActive = response.packageScanningState?.isScanning || false;
         
         // Apply subscription scanning state
-        if (subscriptionActive) {
+        if (subscriptionActive || storageResult.currentSubscriptionProgress) {
           const state = response.subscriptionScanningState;
-          this.applySubscriptionScanningState(true, state.progress, state.message, state.step, state.options);
+          const progressData = storageResult.currentSubscriptionProgress;
+          console.log('Content: Applying subscription scanning state with progress:', progressData);
+          this.applySubscriptionScanningState(true, 
+            progressData?.progress || state.progress, 
+            progressData?.message || state.message, 
+            progressData?.step || state.step, 
+            state.options);
+          
+          // Update progress display with latest data
+          if (progressData && this.floatingWidget) {
+            this.showSubscriptionProgress();
+            this.updateSubscriptionProgress(progressData);
+          }
         } else {
           this.applySubscriptionScanningState(false);
         }
         
         // Apply package scanning state
-        if (packageActive) {
+        if (packageActive || storageResult.currentPackageProgress) {
           const state = response.packageScanningState;
-          this.applyPackageScanningState(true, state.progress, state.message, state.step, state.options);
+          const progressData = storageResult.currentPackageProgress;
+          console.log('Content: Applying package scanning state with progress:', progressData);
+          this.applyPackageScanningState(true, 
+            progressData?.progress || state.progress, 
+            progressData?.message || state.message, 
+            progressData?.step || state.step, 
+            state.options);
+          
+          // Update progress display with latest data
+          if (progressData && this.floatingWidget) {
+            this.showProgress();
+            this.updateProgress(progressData);
+          }
         } else {
           this.applyPackageScanningState(false);
         }
         
         // Update toggle button based on any active scan
-        if (subscriptionActive || packageActive) {
+        if (subscriptionActive || packageActive || storageResult.currentSubscriptionProgress || storageResult.currentPackageProgress) {
+          const activeProgressData = storageResult.currentSubscriptionProgress || storageResult.currentPackageProgress;
           const activeState = subscriptionActive ? response.subscriptionScanningState : response.packageScanningState;
-          const scanType = subscriptionActive ? 'subscription' : 'package';
-          this.updateToggleButtonScanning(true, activeState.progress, scanType);
+          const scanType = (subscriptionActive || storageResult.currentSubscriptionProgress) ? 'subscription' : 'package';
+          this.updateToggleButtonScanning(true, 
+            activeProgressData?.progress || activeState.progress, 
+            scanType);
         } else {
           this.updateToggleButtonScanning(false);
         }
+
+        // Force immediate UI update
+        this.forceWidgetSync();
       } else {
         this.applyScanningState(false);
       }
     } catch (error) {
+      console.error('Content: Error checking scanning state:', error);
       this.applyScanningState(false);
     }
+  }
+
+  /**
+   * Force immediate widget synchronization
+   */
+  forceWidgetSync() {
+    if (!this.floatingWidget) return;
+    
+    // Trigger a manual check of storage and update widget immediately
+    setTimeout(async () => {
+      const storageResult = await chrome.storage.local.get(['currentSubscriptionProgress', 'currentPackageProgress']);
+      
+      if (storageResult.currentSubscriptionProgress) {
+        console.log('Content: Force syncing subscription progress in widget:', storageResult.currentSubscriptionProgress);
+        this.showSubscriptionProgress();
+        this.updateSubscriptionProgress(storageResult.currentSubscriptionProgress);
+        
+        const subscriptionBtn = this.floatingWidget.querySelector('#widget-scanSubscriptionsBtn');
+        if (subscriptionBtn) {
+          subscriptionBtn.disabled = true;
+          subscriptionBtn.textContent = 'Scanning...';
+        }
+      }
+      
+      if (storageResult.currentPackageProgress) {
+        console.log('Content: Force syncing package progress in widget:', storageResult.currentPackageProgress);
+        this.showProgress();
+        this.updateProgress(storageResult.currentPackageProgress);
+        
+        const packageBtn = this.floatingWidget.querySelector('#widget-scanBtn');
+        if (packageBtn) {
+          packageBtn.disabled = true;
+          packageBtn.textContent = 'Scanning...';
+        }
+      }
+    }, 100); // Small delay to ensure widget DOM is ready
   }
 
   // Apply subscription scanning state to UI
@@ -1311,7 +1391,7 @@ class GmailContentScript {
     const element = document.createElement('div');
     element.className = 'package-item';
 
-    const deliveryDate = new Date(pkg.deliveryDate).toLocaleDateString();
+    const deliveryDate = new Date(pkg.deliveryTime).toLocaleDateString();
     const deliveryTime = new Date(pkg.deliveryTime).toLocaleString();
 
     element.innerHTML = `

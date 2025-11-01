@@ -2063,6 +2063,73 @@ async function saveScanningStates() {
   }
 }
 
+/**
+ * Unified progress update function that syncs all components
+ */
+async function updateProgressState(scanType, progressData) {
+  try {
+    const isSubscription = scanType === 'subscription';
+    const state = isSubscription ? subscriptionScanningState : packageScanningState;
+    
+    // Update internal state
+    Object.assign(state, progressData);
+    
+    // Save scanning states
+    await saveScanningStates();
+    
+    // Store current progress for polling
+    const currentProgressKey = isSubscription ? 'currentSubscriptionProgress' : 'currentPackageProgress';
+    const enhancedProgressData = {
+      ...progressData,
+      scanType: scanType,
+      timestamp: Date.now()
+    };
+    
+    if (progressData.step !== 'complete' && progressData.step !== 'error') {
+      await chrome.storage.local.set({ [currentProgressKey]: enhancedProgressData });
+    } else {
+      // For completion/error states, store briefly then clear
+      await chrome.storage.local.set({ [currentProgressKey]: enhancedProgressData });
+      setTimeout(() => {
+        chrome.storage.local.remove(currentProgressKey).catch(() => {});
+      }, 2000);
+    }
+    
+    // Broadcast progress update
+    const progressMessage = {
+      type: MESSAGE_TYPES.PROGRESS_UPDATE,
+      data: enhancedProgressData
+    };
+    
+    // Broadcast scanning state change
+    const stateMessage = {
+      type: 'SCANNING_STATE_CHANGED',
+      data: {
+        isScanning: state.isScanning,
+        progress: state.progress,
+        message: state.message,
+        step: state.step,
+        scanType: scanType
+      }
+    };
+    
+    // Send to popup
+    chrome.runtime.sendMessage(progressMessage).catch(() => {});
+    chrome.runtime.sendMessage(stateMessage).catch(() => {});
+    
+    // Send to all content scripts
+    const tabs = await chrome.tabs.query({});
+    tabs.forEach(tab => {
+      chrome.tabs.sendMessage(tab.id, progressMessage).catch(() => {});
+      chrome.tabs.sendMessage(tab.id, stateMessage).catch(() => {});
+    });
+    
+    console.log(`Progress updated for ${scanType}:`, progressData);
+  } catch (error) {
+    console.error('Failed to update progress state:', error);
+  }
+}
+
 // Initialize scanning states on startup
 loadScanningStates();
 
@@ -2156,68 +2223,9 @@ async function handleMessage(message, sender, sendResponse) {
           });
         });
 
-        // Handle progress updates via chrome.runtime.sendMessage to popup and content script
+        // Handle progress updates using unified function
         const progressCallback = (progressData) => {
-          // Update internal package scanning state
-          packageScanningState.progress = progressData.progress || 0;
-          packageScanningState.message = progressData.message || '';
-          packageScanningState.step = progressData.step || '';
-
-          // Save updated scanning states
-          saveScanningStates();
-
-          // Store progress in chrome.storage for popup to read
-          if (progressData.step !== 'complete' && progressData.step !== 'error') {
-            chrome.storage.local.set({
-              'currentPackageProgress': progressData
-            }).catch(() => {
-              // Ignore storage errors
-            });
-          } else {
-            // For completion/error states, store briefly then clear
-            chrome.storage.local.set({
-              'currentPackageProgress': progressData
-            }).then(() => {
-              // Clear after a short delay to allow UI to show completion
-              setTimeout(() => {
-                chrome.storage.local.remove('currentPackageProgress').catch(() => {});
-              }, 2000);
-            }).catch(() => {});
-          }
-
-          // Broadcast to all listeners (popup and content script)
-          const updateMessage = {
-            type: MESSAGE_TYPES.PROGRESS_UPDATE,
-            data: progressData
-          };
-
-          // Send to all content scripts
-          chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, updateMessage).catch(() => {
-                // Ignore errors if content script not available
-              });
-            });
-          });
-
-          // Also broadcast scanning state change
-          const stateMessage = {
-            type: 'SCANNING_STATE_CHANGED',
-            data: {
-              isScanning: packageScanningState.isScanning,
-              progress: packageScanningState.progress,
-              message: packageScanningState.message,
-              step: packageScanningState.step,
-              scanType: 'package'
-            }
-          };
-
-          chrome.runtime.sendMessage(stateMessage).catch(() => { });
-          chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, stateMessage).catch(() => { });
-            });
-          });
+          updateProgressState('package', progressData);
         };
 
         // Ensure database is initialized before starting package scan
@@ -2355,9 +2363,14 @@ async function handleMessage(message, sender, sendResponse) {
         };
         sendResponse(stateResponse);
 
-        // Also broadcast current states to ensure synchronization
+        // IMMEDIATELY broadcast current states and progress to ensure synchronization
+        // This ensures that when popup/widget opens, it gets the latest state right away
+        
         if (subscriptionScanningState.isScanning) {
-          const syncMessage = {
+          console.log('Background: Broadcasting current subscription state to new component');
+          
+          // Send both state change and progress update messages
+          const syncStateMessage = {
             type: 'SCANNING_STATE_CHANGED',
             data: {
               isScanning: subscriptionScanningState.isScanning,
@@ -2368,16 +2381,33 @@ async function handleMessage(message, sender, sendResponse) {
             }
           };
 
-          chrome.runtime.sendMessage(syncMessage).catch(() => { });
+          const syncProgressMessage = {
+            type: MESSAGE_TYPES.PROGRESS_UPDATE,
+            data: {
+              progress: subscriptionScanningState.progress,
+              message: subscriptionScanningState.message,
+              step: subscriptionScanningState.step,
+              scanType: 'subscription'
+            }
+          };
+
+          // Send to popup and all content scripts
+          chrome.runtime.sendMessage(syncStateMessage).catch(() => { });
+          chrome.runtime.sendMessage(syncProgressMessage).catch(() => { });
+          
           chrome.tabs.query({}, (tabs) => {
             tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, syncMessage).catch(() => { });
+              chrome.tabs.sendMessage(tab.id, syncStateMessage).catch(() => { });
+              chrome.tabs.sendMessage(tab.id, syncProgressMessage).catch(() => { });
             });
           });
         }
 
         if (packageScanningState.isScanning) {
-          const syncMessage = {
+          console.log('Background: Broadcasting current package state to new component');
+          
+          // Send both state change and progress update messages
+          const syncStateMessage = {
             type: 'SCANNING_STATE_CHANGED',
             data: {
               isScanning: packageScanningState.isScanning,
@@ -2388,10 +2418,24 @@ async function handleMessage(message, sender, sendResponse) {
             }
           };
 
-          chrome.runtime.sendMessage(syncMessage).catch(() => { });
+          const syncProgressMessage = {
+            type: MESSAGE_TYPES.PROGRESS_UPDATE,
+            data: {
+              progress: packageScanningState.progress,
+              message: packageScanningState.message,
+              step: packageScanningState.step,
+              scanType: 'package'
+            }
+          };
+
+          // Send to popup and all content scripts
+          chrome.runtime.sendMessage(syncStateMessage).catch(() => { });
+          chrome.runtime.sendMessage(syncProgressMessage).catch(() => { });
+          
           chrome.tabs.query({}, (tabs) => {
             tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, syncMessage).catch(() => { });
+              chrome.tabs.sendMessage(tab.id, syncStateMessage).catch(() => { });
+              chrome.tabs.sendMessage(tab.id, syncProgressMessage).catch(() => { });
             });
           });
         }
@@ -2446,56 +2490,14 @@ async function handleMessage(message, sender, sendResponse) {
           });
         });
 
-        // Handle progress updates via chrome.runtime.sendMessage to popup and content script
+        // Handle progress updates using unified function
         const subscriptionProgressCallback = (progressData) => {
-          // Update internal subscription scanning state
-          subscriptionScanningState.progress = progressData.progress || 0;
-          subscriptionScanningState.message = progressData.message || '';
-          subscriptionScanningState.step = progressData.step || 'subscription_scan';
-
-          // Save updated scanning states
-          saveScanningStates();
-
           // Ensure the progress data has the correct step for subscription scans
           const enhancedProgressData = {
             ...progressData,
-            step: progressData.step === 'complete' || progressData.step === 'error' ? progressData.step : 'subscription_scan',
-            scanType: 'subscription'
+            step: progressData.step === 'complete' || progressData.step === 'error' ? progressData.step : 'subscription_scan'
           };
-
-          // Store progress in chrome.storage for popup to read
-          if (progressData.step !== 'complete' && progressData.step !== 'error') {
-            chrome.storage.local.set({
-              'currentSubscriptionProgress': enhancedProgressData
-            }).catch(() => {
-              // Ignore storage errors
-            });
-          } else {
-            // For completion/error states, store briefly then clear
-            chrome.storage.local.set({
-              'currentSubscriptionProgress': enhancedProgressData
-            }).then(() => {
-              // Clear after a short delay to allow UI to show completion
-              setTimeout(() => {
-                chrome.storage.local.remove('currentSubscriptionProgress').catch(() => {});
-              }, 2000);
-            }).catch(() => {});
-          }
-
-          // Broadcast to all listeners (popup and content script)
-          const updateMessage = {
-            type: MESSAGE_TYPES.PROGRESS_UPDATE,
-            data: enhancedProgressData
-          };
-
-          // Send to all content scripts
-          chrome.tabs.query({}, (tabs) => {
-            tabs.forEach(tab => {
-              chrome.tabs.sendMessage(tab.id, updateMessage).catch(() => {
-                // Ignore errors if content script not available
-              });
-            });
-          });
+          updateProgressState('subscription', enhancedProgressData);
         };
 
         // Ensure database is initialized before starting subscription scan

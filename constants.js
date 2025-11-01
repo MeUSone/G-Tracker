@@ -28,7 +28,7 @@ export const SEARCH_QUERIES = {
  * LLM Configuration
  */
 export const LLM_CONFIG = {
-    TEMPERATURE: 1,
+    TEMPERATURE: 0,
     TOP_K: 3,
     SYSTEM_PROMPT: 'You are a helpful AI assistant. Provide clear and accurate responses.'
 };

@@ -49,6 +49,9 @@ class PopupController {
   }
 
   async init() {
+    // Set up message listeners FIRST before any other initialization
+    this.setupMessageListeners();
+
     // Subscription tracking handlers
     this.elements.scanSubscriptionsBtn.addEventListener('click', () => this.handleScanSubscriptions());
 
@@ -59,6 +62,29 @@ class PopupController {
     this.elements.startDate.value = PACKAGE_CONFIG.DEFAULT_START_DATE;
     this.elements.endDate.value = PACKAGE_CONFIG.DEFAULT_END_DATE;
 
+    // Check if scanning is already in progress IMMEDIATELY after message listeners are set up
+    await this.checkScanningState();
+
+    // Load unpicked packages on startup
+    this.loadUnpickedPackages();
+
+    // Load subscriptions from IndexedDB on startup (like packages)
+    await this.loadSubscriptionsFromDB();
+
+    // Load subscription results from chrome storage on startup (fallback)
+    this.loadSubscriptionResults();
+
+    // Load progress state to restore any active scans
+    this.loadProgressState();
+
+    // Show scan optimization info
+    this.showScanOptimizationInfo();
+
+    // Start polling for progress updates to ensure continuous sync
+    this.startProgressPolling('both');
+  }
+
+  setupMessageListeners() {
     // Listen for progress updates
     chrome.runtime.onMessage.addListener((message) => {
       if (message.type === MESSAGE_TYPES.PROGRESS_UPDATE) {
@@ -152,24 +178,6 @@ class PopupController {
         }
       }
     });
-
-    // Check if scanning is already in progress
-    await this.checkScanningState();
-
-    // Load unpicked packages on startup
-    this.loadUnpickedPackages();
-
-    // Load subscriptions from IndexedDB on startup (like packages)
-    await this.loadSubscriptionsFromDB();
-
-    // Load subscription results from chrome storage on startup (fallback)
-    this.loadSubscriptionResults();
-
-    // Load progress state to restore any active scans
-    this.loadProgressState();
-
-    // Show scan optimization info
-    this.showScanOptimizationInfo();
   }
 
   showResult(text) {
@@ -542,7 +550,7 @@ class PopupController {
     const element = document.createElement('div');
     element.className = 'package-item';
 
-    const deliveryDate = new Date(pkg.deliveryDate).toLocaleDateString();
+    const deliveryDate = new Date(pkg.deliveryTime).toLocaleDateString();
     const deliveryTime = new Date(pkg.deliveryTime).toLocaleString();
 
     element.innerHTML = `
@@ -649,13 +657,22 @@ class PopupController {
   }
 
   /**
-   * Check if scanning is already in progress
+   * Check if scanning is already in progress and sync with storage
    */
   async checkScanningState() {
     try {
+      console.log('Popup: Checking scanning state...');
+      
+      // First check background state
       const response = await chrome.runtime.sendMessage({
         type: MESSAGE_TYPES.GET_SCANNING_STATE
       });
+
+      // Also check storage for current progress
+      const storageResult = await chrome.storage.local.get(['currentSubscriptionProgress', 'currentPackageProgress']);
+
+      console.log('Popup: Background response:', response);
+      console.log('Popup: Storage result:', storageResult);
 
       if (response.success) {
         const subscriptionActive = response.subscriptionScanningState?.isScanning || false;
@@ -664,30 +681,78 @@ class PopupController {
         console.log('Popup checkScanningState - subscriptionActive:', subscriptionActive, 'packageActive:', packageActive);
 
         // Apply subscription scanning state
-        if (subscriptionActive) {
+        if (subscriptionActive || storageResult.currentSubscriptionProgress) {
           const state = response.subscriptionScanningState;
-          console.log('Popup: Applying subscription scanning state');
-          this.applySubscriptionScanningState(true, state.progress, state.message, state.step, state.options);
+          const progressData = storageResult.currentSubscriptionProgress;
+          console.log('Popup: Applying subscription scanning state with progress:', progressData);
+          this.applySubscriptionScanningState(true, 
+            progressData?.progress || state.progress, 
+            progressData?.message || state.message, 
+            progressData?.step || state.step, 
+            state.options);
+          
+          // Update progress display with latest data
+          if (progressData) {
+            this.showSubscriptionProgress();
+            this.updateSubscriptionProgress(progressData);
+          }
         } else {
           this.applySubscriptionScanningState(false);
         }
 
         // Apply package scanning state
-        if (packageActive) {
+        if (packageActive || storageResult.currentPackageProgress) {
           const state = response.packageScanningState;
-          console.log('Popup: Applying package scanning state');
-          this.applyPackageScanningState(true, state.progress, state.message, state.step, state.options);
+          const progressData = storageResult.currentPackageProgress;
+          console.log('Popup: Applying package scanning state with progress:', progressData);
+          this.applyPackageScanningState(true, 
+            progressData?.progress || state.progress, 
+            progressData?.message || state.message, 
+            progressData?.step || state.step, 
+            state.options);
+          
+          // Update progress display with latest data
+          if (progressData) {
+            this.showProgress();
+            this.updateProgress(progressData);
+          }
         } else {
           this.applyPackageScanningState(false);
         }
+
+        // Force immediate UI update
+        this.forceUISync();
       } else {
         this.applySubscriptionScanningState(false);
         this.applyPackageScanningState(false);
       }
     } catch (error) {
+      console.error('Popup: Error checking scanning state:', error);
       this.applySubscriptionScanningState(false);
       this.applyPackageScanningState(false);
     }
+  }
+
+  /**
+   * Force immediate UI synchronization
+   */
+  forceUISync() {
+    // Trigger a manual check of storage and update UI immediately
+    setTimeout(async () => {
+      const storageResult = await chrome.storage.local.get(['currentSubscriptionProgress', 'currentPackageProgress']);
+      
+      if (storageResult.currentSubscriptionProgress) {
+        console.log('Popup: Force syncing subscription progress:', storageResult.currentSubscriptionProgress);
+        this.showSubscriptionProgress();
+        this.updateSubscriptionProgress(storageResult.currentSubscriptionProgress);
+      }
+      
+      if (storageResult.currentPackageProgress) {
+        console.log('Popup: Force syncing package progress:', storageResult.currentPackageProgress);
+        this.showProgress();
+        this.updateProgress(storageResult.currentPackageProgress);
+      }
+    }, 100); // Small delay to ensure DOM is ready
   }
 
   /**
@@ -972,7 +1037,7 @@ class PopupController {
   }
 
   /**
-   * Start polling for progress updates
+   * Start unified progress polling for both scan types
    */
   startProgressPolling(scanType) {
     // Stop any existing polling first
@@ -980,36 +1045,47 @@ class PopupController {
 
     this.progressPollingInterval = setInterval(async () => {
       try {
-        const storageKey = scanType === 'subscription' ? 'currentSubscriptionProgress' : 'currentPackageProgress';
-        const result = await chrome.storage.local.get(storageKey);
+        // Check both subscription and package progress
+        const result = await chrome.storage.local.get(['currentSubscriptionProgress', 'currentPackageProgress']);
 
-        if (result[storageKey]) {
-          const progressData = result[storageKey];
-
-          if (scanType === 'subscription') {
-            this.updateSubscriptionProgress(progressData);
-          } else {
-            this.updateProgress(progressData);
-          }
+        // Handle subscription progress
+        if (result.currentSubscriptionProgress) {
+          const progressData = result.currentSubscriptionProgress;
+          this.updateSubscriptionProgress(progressData);
 
           // Stop polling if scan is complete or errored
           if (progressData.step === 'complete' || progressData.step === 'error') {
-            this.stopProgressPolling();
-
-            // Handle completion for subscription scans
-            if (scanType === 'subscription') {
-              setTimeout(() => {
-                this.elements.scanSubscriptionsBtn.disabled = false;
-                this.elements.scanSubscriptionsBtn.textContent = '🔍 Scan My Current Month Subscriptions';
-                this.hideSubscriptionProgress();
-                if (progressData.step === 'complete') {
-                  this.loadSubscriptionsFromDB();
-                }
-              }, 2000);
-            }
+            setTimeout(() => {
+              this.elements.scanSubscriptionsBtn.disabled = false;
+              this.elements.scanSubscriptionsBtn.textContent = '🔍 Scan My Current Month Subscriptions';
+              this.hideSubscriptionProgress();
+              if (progressData.step === 'complete') {
+                this.loadSubscriptionsFromDB();
+              }
+            }, 2000);
           }
-        } else {
-          // No progress data found, stop polling
+        }
+
+        // Handle package progress
+        if (result.currentPackageProgress) {
+          const progressData = result.currentPackageProgress;
+          this.updateProgress(progressData);
+
+          // Stop polling if scan is complete or errored
+          if (progressData.step === 'complete' || progressData.step === 'error') {
+            setTimeout(() => {
+              this.elements.scanPackagesBtn.disabled = false;
+              this.elements.scanPackagesBtn.textContent = '🔍 Scan for Package Deliveries';
+              this.hideProgress();
+              if (progressData.step === 'complete') {
+                this.loadUnpickedPackages();
+              }
+            }, 2000);
+          }
+        }
+
+        // Stop polling if no active progress found
+        if (!result.currentSubscriptionProgress && !result.currentPackageProgress) {
           this.stopProgressPolling();
         }
       } catch (error) {
